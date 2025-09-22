@@ -3,11 +3,28 @@ import os
 
 class Config:
     # Model settings
-    model_name = "ai4bharat/IndicF5-TTS"
+    model_name = "ai4bharat/IndicF5"  # Corrected: Use base IndicF5 model
     language = "malayalam"
     
     # Training settings - adjusted for RunPod
-    batch_size = 8 if torch.cuda.get_device_properties(0).total_memory > 20e9 else 4
+    # Safer batch size calculation with fallback
+    @staticmethod
+    def get_batch_size():
+        try:
+            if torch.cuda.is_available():
+                total_memory = torch.cuda.get_device_properties(0).total_memory
+                if total_memory > 20e9:  # > 20GB
+                    return 8
+                elif total_memory > 10e9:  # > 10GB
+                    return 4
+                else:
+                    return 2
+            else:
+                return 2
+        except:
+            return 2  # Safe fallback
+    
+    batch_size = get_batch_size()
     learning_rate = 5e-5
     num_epochs = 15
     warmup_steps = 300
@@ -42,3 +59,8 @@ class Config:
     # Data filtering
     max_duration = 10.0  # Filter out audio longer than 10 seconds
     min_text_length = 5   # Minimum characters in transcription
+    
+    # Safety settings
+    fp16 = True  # Use mixed precision training
+    gradient_checkpointing = True  # Save memory
+    dataloader_drop_last = True  # Avoid size mismatch issues
