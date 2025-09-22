@@ -1,0 +1,33 @@
+# requirements.txt for IndicF5 Malayalam Fine-tuning on RunPod
+
+# Core ML libraries
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+transformers>=4.35.0
+accelerate>=0.24.0
+
+# Data processing
+datasets>=2.14.0
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Audio processing  
+soundfile>=0.12.1
+librosa>=0.10.0
+scipy>=1.11.0
+resampy>=0.4.0
+
+# Utilities
+tqdm>=4.65.0
+wandb>=0.15.0
+huggingface-hub>=0.17.0
+
+# System utilities
+psutil>=5.9.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Optional dependencies
+# jupyter>=1.0.0  # Uncomment if you want to use Jupyter notebooks
+# tensorboard>=2.14.0  # Uncomment if you want to use TensorBoard logging
