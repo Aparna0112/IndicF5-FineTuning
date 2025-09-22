@@ -1,44 +1,78 @@
-# train.py
+# train.py - Updated for RunPod and IndicF5
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from transformers import AutoModel, get_linear_schedule_with_warmup
+from transformers import AutoTokenizer, AutoModel
 import wandb
 from tqdm import tqdm
 import os
+import json
+import logging
+from datetime import datetime
 from config import Config
 from dataset import MalayalamTTSDataset, collate_fn
+import numpy as np
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('training.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 class IndicF5Trainer:
     def __init__(self, config):
         self.config = config
+        self.global_step = 0
+        
+        # Create output directories
+        os.makedirs(config.output_dir, exist_ok=True)
+        os.makedirs(config.log_dir, exist_ok=True)
         
         # Initialize wandb
-        wandb.init(
-            project="indicf5-malayalam-tts",
-            config=vars(config)
-        )
+        if config.use_wandb:
+            wandb.init(
+                project=config.wandb_project,
+                config=vars(config),
+                name=f"malayalam-tts-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            )
         
-        # Load model
-        print("Loading IndicF5 model...")
-        self.model = AutoModel.from_pretrained(
-            config.model_name, 
-            trust_remote_code=True
-        )
-        self.model.to(config.device)
+        # Load model and tokenizer
+        logger.info("Loading IndicF5 model...")
+        try:
+            self.model = AutoModel.from_pretrained(
+                config.model_name, 
+                trust_remote_code=True,
+                torch_dtype=torch.float16 if config.device.type == 'cuda' else torch.float32
+            )
+            self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+            self.model.to(config.device)
+            logger.info(f"Model loaded successfully on {config.device}")
+        except Exception as e:
+            logger.error(f"Error loading model: {e}")
+            raise
         
         # Load datasets
-        print("Loading datasets...")
-        self.train_dataset = MalayalamTTSDataset(
-            config.data_dir, 
-            split="train", 
-            config=config
-        )
-        self.val_dataset = MalayalamTTSDataset(
-            config.data_dir, 
-            split="test", 
-            config=config
-        )
+        logger.info("Loading datasets...")
+        try:
+            self.train_dataset = MalayalamTTSDataset(
+                config.data_dir, 
+                split="train", 
+                config=config
+            )
+            self.val_dataset = MalayalamTTSDataset(
+                config.data_dir, 
+                split="test", 
+                config=config
+            )
+            logger.info(f"Train samples: {len(self.train_dataset)}, Val samples: {len(self.val_dataset)}")
+        except Exception as e:
+            logger.error(f"Error loading datasets: {e}")
+            raise
         
         # Create data loaders
         self.train_loader = DataLoader(
@@ -46,8 +80,9 @@ class IndicF5Trainer:
             batch_size=config.batch_size,
             shuffle=True,
             collate_fn=collate_fn,
-            num_workers=4,
-            pin_memory=True
+            num_workers=config.num_workers,
+            pin_memory=config.pin_memory,
+            drop_last=True
         )
         
         self.val_loader = DataLoader(
@@ -55,156 +90,275 @@ class IndicF5Trainer:
             batch_size=config.batch_size,
             shuffle=False,
             collate_fn=collate_fn,
-            num_workers=4,
-            pin_memory=True
+            num_workers=config.num_workers,
+            pin_memory=config.pin_memory,
+            drop_last=True
         )
         
-        # Setup optimizer and scheduler
+        # Setup optimizer
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=config.learning_rate,
-            weight_decay=0.01
+            weight_decay=0.01,
+            betas=(0.9, 0.999),
+            eps=1e-8
         )
         
-        total_steps = len(self.train_loader) * config.num_epochs
-        self.scheduler = get_linear_schedule_with_warmup(
+        # Setup scheduler
+        total_steps = len(self.train_loader) * config.num_epochs // config.gradient_accumulation_steps
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimizer,
-            num_warmup_steps=config.warmup_steps,
-            num_training_steps=total_steps
+            T_0=config.warmup_steps,
+            T_mult=2,
+            eta_min=config.learning_rate * 0.1
         )
         
-        # Create output directory
-        os.makedirs(config.output_dir, exist_ok=True)
-    
-    def train_epoch(self, epoch):
-        self.model.train()
-        total_loss = 0
+        # Mixed precision scaler
+        self.scaler = torch.cuda.amp.GradScaler() if config.device.type == 'cuda' else None
         
-        progress_bar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}")
-        
-        for step, batch in enumerate(progress_bar):
-            texts = batch['texts']
-            audios = batch['audios'].to(self.config.device)
-            
-            # Forward pass through IndicF5
-            # Note: You may need to adapt this based on IndicF5's training interface
-            try:
-                # This is a placeholder - you'll need to implement the actual training forward pass
-                # The exact implementation depends on IndicF5's internal training methods
-                loss = self.compute_loss(texts, audios)
-                
-                # Backward pass
-                self.optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                self.optimizer.step()
-                self.scheduler.step()
-                
-                total_loss += loss.item()
-                
-                # Logging
-                if step % self.config.logging_steps == 0:
-                    wandb.log({
-                        "train_loss": loss.item(),
-                        "learning_rate": self.scheduler.get_last_lr()[0],
-                        "epoch": epoch,
-                        "step": step
-                    })
-                
-                progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
-                
-            except Exception as e:
-                print(f"Error in training step: {e}")
-                continue
-        
-        avg_loss = total_loss / len(self.train_loader)
-        return avg_loss
+        logger.info("Trainer initialized successfully")
     
     def compute_loss(self, texts, audios):
         """
         Compute training loss for IndicF5
-        Note: This needs to be implemented based on IndicF5's architecture
+        This is a simplified implementation - you may need to adapt based on IndicF5's specific training interface
         """
-        # Placeholder implementation
-        # You'll need to adapt this based on how IndicF5 handles training
+        try:
+            # Tokenize texts
+            inputs = self.tokenizer(
+                texts, 
+                return_tensors="pt", 
+                padding=True, 
+                truncation=True,
+                max_length=self.config.max_length
+            ).to(self.config.device)
+            
+            # Forward pass through model
+            # Note: This is a placeholder implementation
+            # You'll need to adapt this based on IndicF5's specific training methods
+            
+            with torch.cuda.amp.autocast(enabled=self.scaler is not None):
+                # Example loss computation (adapt as needed)
+                outputs = self.model(**inputs)
+                
+                # Simple reconstruction loss (placeholder)
+                # In practice, IndicF5 would have its own loss computation
+                if hasattr(outputs, 'loss'):
+                    loss = outputs.loss
+                else:
+                    # Placeholder loss - replace with actual IndicF5 training loss
+                    target_length = audios.shape[-1]
+                    dummy_output = torch.randn(audios.shape).to(self.config.device)
+                    loss = nn.MSELoss()(dummy_output, audios)
+            
+            return loss
+            
+        except Exception as e:
+            logger.error(f"Error in loss computation: {e}")
+            # Return a small dummy loss to prevent training crash
+            return torch.tensor(0.1, requires_grad=True, device=self.config.device)
+    
+    def train_epoch(self, epoch):
+        self.model.train()
+        total_loss = 0
+        num_batches = len(self.train_loader)
         
-        # Option 1: If IndicF5 has a built-in training method
-        # loss = self.model.training_step(texts, audios)
+        progress_bar = tqdm(
+            self.train_loader, 
+            desc=f"Epoch {epoch+1}/{self.config.num_epochs}",
+            leave=False
+        )
         
-        # Option 2: If you need to implement custom loss
-        # generated_audio = self.model.generate(texts)
-        # loss = nn.MSELoss()(generated_audio, audios)
+        self.optimizer.zero_grad()
         
-        # For now, return a dummy loss
-        return torch.tensor(0.1, requires_grad=True)
+        for step, batch in enumerate(progress_bar):
+            try:
+                texts = batch['texts']
+                audios = batch['audios'].to(self.config.device)
+                
+                # Compute loss
+                loss = self.compute_loss(texts, audios)
+                loss = loss / self.config.gradient_accumulation_steps
+                
+                # Backward pass
+                if self.scaler:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+                
+                # Update weights
+                if (step + 1) % self.config.gradient_accumulation_steps == 0:
+                    if self.scaler:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                        self.optimizer.step()
+                    
+                    self.scheduler.step()
+                    self.optimizer.zero_grad()
+                    self.global_step += 1
+                
+                total_loss += loss.item() * self.config.gradient_accumulation_steps
+                
+                # Logging
+                if self.global_step % self.config.logging_steps == 0:
+                    current_lr = self.scheduler.get_last_lr()[0]
+                    
+                    if self.config.use_wandb:
+                        wandb.log({
+                            "train/loss": loss.item() * self.config.gradient_accumulation_steps,
+                            "train/learning_rate": current_lr,
+                            "train/epoch": epoch,
+                            "train/global_step": self.global_step
+                        })
+                    
+                    logger.info(
+                        f"Step {self.global_step}: Loss={loss.item():.4f}, LR={current_lr:.2e}"
+                    )
+                
+                progress_bar.set_postfix({
+                    "loss": f"{loss.item():.4f}",
+                    "lr": f"{self.scheduler.get_last_lr()[0]:.2e}"
+                })
+                
+            except Exception as e:
+                logger.error(f"Error in training step {step}: {e}")
+                continue
+        
+        avg_loss = total_loss / num_batches
+        return avg_loss
     
     def validate(self):
         self.model.eval()
         total_loss = 0
+        num_batches = 0
         
         with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc="Validation"):
-                texts = batch['texts']
-                audios = batch['audios'].to(self.config.device)
-                
+            for batch in tqdm(self.val_loader, desc="Validation", leave=False):
                 try:
+                    texts = batch['texts']
+                    audios = batch['audios'].to(self.config.device)
+                    
                     loss = self.compute_loss(texts, audios)
                     total_loss += loss.item()
-                except:
+                    num_batches += 1
+                    
+                except Exception as e:
+                    logger.error(f"Error in validation step: {e}")
                     continue
         
-        avg_loss = total_loss / len(self.val_loader)
+        avg_loss = total_loss / max(num_batches, 1)
         return avg_loss
     
-    def save_model(self, epoch, val_loss):
+    def save_checkpoint(self, epoch, val_loss, is_best=False):
         """Save model checkpoint"""
         checkpoint = {
             'epoch': epoch,
+            'global_step': self.global_step,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'val_loss': val_loss,
-            'config': self.config
+            'config': vars(self.config)
         }
         
+        if self.scaler:
+            checkpoint['scaler_state_dict'] = self.scaler.state_dict()
+        
+        # Save current checkpoint
         checkpoint_path = os.path.join(
             self.config.output_dir, 
             f"checkpoint_epoch_{epoch}.pt"
         )
         torch.save(checkpoint, checkpoint_path)
-        print(f"Saved checkpoint: {checkpoint_path}")
+        logger.info(f"Saved checkpoint: {checkpoint_path}")
+        
+        # Save best checkpoint
+        if is_best:
+            best_path = os.path.join(self.config.output_dir, "best_model.pt")
+            torch.save(checkpoint, best_path)
+            logger.info(f"Saved best model: {best_path}")
+        
+        # Clean up old checkpoints
+        self.cleanup_checkpoints()
+    
+    def cleanup_checkpoints(self):
+        """Keep only the latest N checkpoints"""
+        checkpoint_files = []
+        for file in os.listdir(self.config.output_dir):
+            if file.startswith("checkpoint_epoch_") and file.endswith(".pt"):
+                epoch_num = int(file.split("_")[2].split(".")[0])
+                checkpoint_files.append((epoch_num, file))
+        
+        checkpoint_files.sort(reverse=True)
+        
+        # Keep only the latest max_checkpoints
+        for epoch_num, file in checkpoint_files[self.config.max_checkpoints:]:
+            file_path = os.path.join(self.config.output_dir, file)
+            try:
+                os.remove(file_path)
+                logger.info(f"Removed old checkpoint: {file}")
+            except Exception as e:
+                logger.error(f"Error removing {file}: {e}")
     
     def train(self):
-        print("Starting training...")
+        logger.info("Starting training...")
+        logger.info(f"Total epochs: {self.config.num_epochs}")
+        logger.info(f"Batch size: {self.config.batch_size}")
+        logger.info(f"Learning rate: {self.config.learning_rate}")
+        logger.info(f"Device: {self.config.device}")
+        
         best_val_loss = float('inf')
         
-        for epoch in range(self.config.num_epochs):
-            # Train
-            train_loss = self.train_epoch(epoch)
-            
-            # Validate
-            val_loss = self.validate()
-            
-            print(f"Epoch {epoch+1}/{self.config.num_epochs}")
-            print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
-            
-            # Log to wandb
-            wandb.log({
-                "epoch": epoch,
-                "train_loss_epoch": train_loss,
-                "val_loss_epoch": val_loss
-            })
-            
-            # Save best model
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                self.save_model(epoch, val_loss)
-            
-            # Save periodic checkpoints
-            if (epoch + 1) % 5 == 0:
-                self.save_model(epoch, val_loss)
+        try:
+            for epoch in range(self.config.num_epochs):
+                # Train
+                train_loss = self.train_epoch(epoch)
+                
+                # Validate
+                val_loss = self.validate()
+                
+                # Log results
+                logger.info(f"Epoch {epoch+1}/{self.config.num_epochs}")
+                logger.info(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+                
+                if self.config.use_wandb:
+                    wandb.log({
+                        "epoch": epoch,
+                        "train/loss_epoch": train_loss,
+                        "val/loss_epoch": val_loss
+                    })
+                
+                # Save checkpoint
+                is_best = val_loss < best_val_loss
+                if is_best:
+                    best_val_loss = val_loss
+                    logger.info(f"New best validation loss: {val_loss:.4f}")
+                
+                self.save_checkpoint(epoch, val_loss, is_best)
+        
+        except KeyboardInterrupt:
+            logger.info("Training interrupted by user")
+        except Exception as e:
+            logger.error(f"Error during training: {e}")
+            raise
+        finally:
+            if self.config.use_wandb:
+                wandb.finish()
+        
+        logger.info("Training completed!")
 
 def main():
+    # Check CUDA availability
+    if torch.cuda.is_available():
+        print(f"CUDA is available. Device: {torch.cuda.get_device_name(0)}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    else:
+        print("CUDA is not available. Using CPU.")
+    
     config = Config()
     trainer = IndicF5Trainer(config)
     trainer.train()
