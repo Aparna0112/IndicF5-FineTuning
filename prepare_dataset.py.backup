@@ -1,0 +1,24 @@
+import os
+from datasets import load_dataset, Dataset, Features, Audio, Value
+import soundfile as sf
+import numpy as np
+from tqdm import tqdm
+import json
+
+def prepare_malayalam_tts_data():
+    print("Loading Malayalam TTS dataset from HuggingFace...")
+    try:
+        dataset_raw = load_dataset(
+            "ceymox/MALAYALAM_STT_COMBINED_1_2",
+            split="train",
+            features=Features({
+                'audio': Audio(decode=False),
+                'transcription': Value('string')
+            })
+        )
+        print(f"Loaded {len(dataset_raw)} samples")
+        os.makedirs("./data/audio", exist_ok=True)
+        os.makedirs("./data/processed", exist_ok=True)
+        processed_data = []
+        skipped = 0
+        print("Processing samples...")
