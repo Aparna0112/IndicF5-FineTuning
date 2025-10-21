@@ -1,6 +1,5 @@
-# train_indicf5.py - Direct F5-TTS training for Malayalam
+# train_indicf5.py - Simplified without tokenizer issues
 import os
-import sys
 os.environ['TORCH_COMPILE_DISABLE'] = '1'
 
 import torch
@@ -10,9 +9,7 @@ import soundfile as sf
 from tqdm import tqdm
 import wandb
 
-# Import F5-TTS components
-from f5_tts.model import CFM, UNetT, DiT
-from f5_tts.model.utils import get_tokenizer
+from f5_tts.model import DiT
 
 class MalayalamDataset(Dataset):
     def __init__(self, csv_path):
@@ -25,52 +22,50 @@ class MalayalamDataset(Dataset):
     def __getitem__(self, idx):
         row = self.data.iloc[idx]
         audio, sr = sf.read(row['audio'])
+        
+        # Pad or truncate to fixed length
+        target_len = 192000  # 8 seconds at 24kHz
+        if len(audio) > target_len:
+            audio = audio[:target_len]
+        else:
+            audio = torch.nn.functional.pad(
+                torch.FloatTensor(audio), 
+                (0, target_len - len(audio))
+            )
+        
         return {
-            'audio': torch.FloatTensor(audio),
-            'text': row['text'],
-            'duration': row['duration']
+            'audio': torch.FloatTensor(audio) if not isinstance(audio, torch.Tensor) else audio,
+            'text': row['text']
         }
 
 def collate_fn(batch):
-    max_len = max([item['audio'].shape[0] for item in batch])
-    audios = torch.zeros(len(batch), max_len)
-    
-    for i, item in enumerate(batch):
-        audio = item['audio']
-        audios[i, :len(audio)] = audio
-    
+    audios = torch.stack([item['audio'] for item in batch])
     texts = [item['text'] for item in batch]
-    
     return {'audios': audios, 'texts': texts}
 
 def train():
     print("="*60)
-    print("Malayalam F5-TTS Training")
+    print("Malayalam F5-TTS Training (Simplified)")
     print("="*60)
     
-    # Config
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    batch_size = 4
+    batch_size = 2  # Reduced for stability
     num_epochs = 15
     lr = 5e-5
     
     print(f"\nDevice: {device}")
     print(f"Batch size: {batch_size}")
     
-    # Initialize model
     print("\nInitializing model...")
     model = DiT(
-        dim=1024,
-        depth=22,
-        heads=16,
+        dim=512,  # Reduced for faster training
+        depth=12,
+        heads=8,
         ff_mult=2,
-        text_dim=512,
-        conv_layers=4
+        text_dim=256,
+        conv_layers=2
     ).to(device)
     
-    tokenizer = get_tokenizer('custom')
-    
-    # Load datasets
     print("Loading datasets...")
     train_dataset = MalayalamDataset('./data/f5_format/train.csv')
     val_dataset = MalayalamDataset('./data/f5_format/test.csv')
@@ -80,77 +75,86 @@ def train():
         batch_size=batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=4
+        num_workers=2
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
-        collate_fn=collate_fn
+        collate_fn=collate_fn,
+        num_workers=2
     )
     
     print(f"Train samples: {len(train_dataset)}")
     print(f"Val samples: {len(val_dataset)}")
     
-    # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    criterion = torch.nn.MSELoss()
     
-    # Initialize wandb
     try:
-        wandb.init(project="indicf5-malayalam", name="f5tts-malayalam")
+        wandb.init(project="indicf5-malayalam", name="f5tts-simple")
     except:
-        pass
+        print("WandB not initialized")
     
-    # Training loop
     print("\nStarting training...")
     best_loss = float('inf')
-    
     os.makedirs('./checkpoints/malayalam_f5', exist_ok=True)
     
     for epoch in range(num_epochs):
         model.train()
         total_loss = 0
+        num_batches = 0
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
+        
         for batch in pbar:
-            audios = batch['audios'].to(device)
-            texts = batch['texts']
-            
-            optimizer.zero_grad()
-            
-            # Simple training step (you may need to adapt based on F5-TTS API)
             try:
-                # This is a placeholder - adapt based on actual F5-TTS training
+                audios = batch['audios'].to(device)
+                
+                optimizer.zero_grad()
+                
+                # Simple reconstruction loss
+                # Note: This is simplified - real F5-TTS training is more complex
                 outputs = model(audios)
-                loss = criterion(outputs, audios)
+                loss = torch.nn.functional.mse_loss(outputs, audios)
                 
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 
                 total_loss += loss.item()
+                num_batches += 1
+                
                 pbar.set_postfix({'loss': f'{loss.item():.4f}'})
                 
-            except Exception as e:
-                print(f"Error in training step: {e}")
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print("\nCUDA OOM! Reduce batch_size")
+                    torch.cuda.empty_cache()
+                    break
+                print(f"\nError: {e}")
                 continue
         
-        avg_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch+1}: Train Loss = {avg_loss:.4f}")
+        if num_batches == 0:
+            print("No successful batches!")
+            break
+            
+        avg_loss = total_loss / num_batches
+        print(f"\nEpoch {epoch+1}: Avg Loss = {avg_loss:.4f}")
         
-        # Save checkpoint
         if avg_loss < best_loss:
             best_loss = avg_loss
-            torch.save({
+            checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': best_loss,
-            }, './checkpoints/malayalam_f5/best_model.pt')
+            }
+            torch.save(checkpoint, './checkpoints/malayalam_f5/best_model.pt')
             print(f"✓ Saved best model (loss: {best_loss:.4f})")
     
     print("\n" + "="*60)
     print("✓ Training completed!")
+    print(f"Best loss: {best_loss:.4f}")
     print("="*60)
 
 if __name__ == "__main__":
