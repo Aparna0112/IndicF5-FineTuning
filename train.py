@@ -1,4 +1,4 @@
-# train.py - Corrected for RunPod and IndicF5
+# train.py - Fixed for transformers 4.50.3
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -13,7 +13,6 @@ from config import Config
 from dataset import MalayalamTTSDataset, collate_fn
 import numpy as np
 
-# Setup logging
 def setup_logging():
     os.makedirs("./logs", exist_ok=True)
     logging.basicConfig(
@@ -33,11 +32,9 @@ class IndicF5Trainer:
         self.config = config
         self.global_step = 0
         
-        # Create output directories
         os.makedirs(config.output_dir, exist_ok=True)
         os.makedirs(config.log_dir, exist_ok=True)
         
-        # Initialize wandb
         if config.use_wandb:
             try:
                 wandb.init(
@@ -50,25 +47,22 @@ class IndicF5Trainer:
                 logger.warning(f"Wandb initialization failed: {e}")
                 config.use_wandb = False
         
-        # Load model and tokenizer
         logger.info("Loading IndicF5 model...")
         try:
             self.model = AutoModel.from_pretrained(
                 config.model_name, 
                 trust_remote_code=True,
-                torch_dtype=torch.float16 if config.fp16 and config.device.type == 'cuda' else torch.float32
+                torch_dtype=torch.float16 if config.fp16 and config.device.type == 'cuda' else torch.float32,
+                device_map="auto",
+                low_cpu_mem_usage=True
             )
             
-            # Try to load tokenizer, fallback if not available
             try:
                 self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
             except Exception as e:
-                logger.warning(f"Could not load tokenizer: {e}. Using basic tokenization.")
+                logger.warning(f"Could not load tokenizer: {e}")
                 self.tokenizer = None
             
-            self.model.to(config.device)
-            
-            # Enable gradient checkpointing to save memory
             if config.gradient_checkpointing and hasattr(self.model, 'gradient_checkpointing_enable'):
                 self.model.gradient_checkpointing_enable()
             
@@ -78,25 +72,15 @@ class IndicF5Trainer:
             logger.error(f"Error loading model: {e}")
             raise
         
-        # Load datasets
         logger.info("Loading datasets...")
         try:
-            self.train_dataset = MalayalamTTSDataset(
-                config.data_dir, 
-                split="train", 
-                config=config
-            )
-            self.val_dataset = MalayalamTTSDataset(
-                config.data_dir, 
-                split="test", 
-                config=config
-            )
+            self.train_dataset = MalayalamTTSDataset(config.data_dir, split="train", config=config)
+            self.val_dataset = MalayalamTTSDataset(config.data_dir, split="test", config=config)
             logger.info(f"Train samples: {len(self.train_dataset)}, Val samples: {len(self.val_dataset)}")
         except Exception as e:
             logger.error(f"Error loading datasets: {e}")
             raise
         
-        # Create data loaders
         self.train_loader = DataLoader(
             self.train_dataset,
             batch_size=config.batch_size,
@@ -117,7 +101,6 @@ class IndicF5Trainer:
             drop_last=config.dataloader_drop_last
         )
         
-        # Setup optimizer
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=config.learning_rate,
@@ -126,7 +109,6 @@ class IndicF5Trainer:
             eps=1e-8
         )
         
-        # Setup scheduler
         total_steps = len(self.train_loader) * config.num_epochs // config.gradient_accumulation_steps
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimizer,
@@ -135,26 +117,17 @@ class IndicF5Trainer:
             eta_min=config.learning_rate * 0.1
         )
         
-        # Mixed precision scaler
         self.scaler = torch.cuda.amp.GradScaler() if config.fp16 and config.device.type == 'cuda' else None
         
         logger.info("Trainer initialized successfully")
     
     def compute_loss(self, texts, audios):
-        """
-        Compute training loss for IndicF5
-        This is a simplified implementation - adapt based on IndicF5's specific training interface
-        """
         try:
-            # Use autocast for mixed precision
             with torch.cuda.amp.autocast(enabled=self.scaler is not None):
-                
-                # Method 1: Try IndicF5's built-in training method
                 if hasattr(self.model, 'compute_loss'):
                     loss = self.model.compute_loss(texts, audios)
                     return loss
                 
-                # Method 2: Try forward pass with texts
                 if self.tokenizer is not None:
                     inputs = self.tokenizer(
                         texts, 
@@ -169,21 +142,16 @@ class IndicF5Trainer:
                     if hasattr(outputs, 'loss') and outputs.loss is not None:
                         return outputs.loss
                 
-                # Method 3: Placeholder implementation for development
-                # Replace this with actual IndicF5 training loss when available
-                logger.warning("Using placeholder loss - replace with actual IndicF5 training method")
-                
-                # Simple reconstruction loss as placeholder
+                logger.warning("Using placeholder loss")
                 batch_size = len(texts)
                 target_shape = audios.shape
                 dummy_output = torch.randn(target_shape, device=self.config.device, requires_grad=True)
-                loss = nn.MSELoss()(dummy_output, audios) * 0.1  # Small loss for stability
+                loss = nn.MSELoss()(dummy_output, audios) * 0.1
                 
                 return loss
                 
         except Exception as e:
             logger.error(f"Error in loss computation: {e}")
-            # Return a very small dummy loss to prevent training crash
             return torch.tensor(0.01, requires_grad=True, device=self.config.device)
     
     def train_epoch(self, epoch):
@@ -204,17 +172,14 @@ class IndicF5Trainer:
                 texts = batch['texts']
                 audios = batch['audios'].to(self.config.device)
                 
-                # Compute loss
                 loss = self.compute_loss(texts, audios)
                 loss = loss / self.config.gradient_accumulation_steps
                 
-                # Backward pass
                 if self.scaler:
                     self.scaler.scale(loss).backward()
                 else:
                     loss.backward()
                 
-                # Update weights
                 if (step + 1) % self.config.gradient_accumulation_steps == 0:
                     if self.scaler:
                         self.scaler.unscale_(self.optimizer)
@@ -231,7 +196,6 @@ class IndicF5Trainer:
                 
                 total_loss += loss.item() * self.config.gradient_accumulation_steps
                 
-                # Logging
                 if self.global_step % self.config.logging_steps == 0:
                     current_lr = self.scheduler.get_last_lr()[0]
                     
@@ -244,11 +208,9 @@ class IndicF5Trainer:
                                 "train/global_step": self.global_step
                             })
                         except:
-                            pass  # Continue if wandb fails
+                            pass
                     
-                    logger.info(
-                        f"Step {self.global_step}: Loss={loss.item():.4f}, LR={current_lr:.2e}"
-                    )
+                    logger.info(f"Step {self.global_step}: Loss={loss.item():.4f}, LR={current_lr:.2e}")
                 
                 progress_bar.set_postfix({
                     "loss": f"{loss.item():.4f}",
@@ -293,7 +255,6 @@ class IndicF5Trainer:
         return avg_loss
     
     def save_checkpoint(self, epoch, val_loss, is_best=False):
-        """Save model checkpoint"""
         checkpoint = {
             'epoch': epoch,
             'global_step': self.global_step,
@@ -307,25 +268,18 @@ class IndicF5Trainer:
         if self.scaler:
             checkpoint['scaler_state_dict'] = self.scaler.state_dict()
         
-        # Save current checkpoint
-        checkpoint_path = os.path.join(
-            self.config.output_dir, 
-            f"checkpoint_epoch_{epoch}.pt"
-        )
+        checkpoint_path = os.path.join(self.config.output_dir, f"checkpoint_epoch_{epoch}.pt")
         torch.save(checkpoint, checkpoint_path)
         logger.info(f"Saved checkpoint: {checkpoint_path}")
         
-        # Save best checkpoint
         if is_best:
             best_path = os.path.join(self.config.output_dir, "best_model.pt")
             torch.save(checkpoint, best_path)
             logger.info(f"Saved best model: {best_path}")
         
-        # Clean up old checkpoints
         self.cleanup_checkpoints()
     
     def cleanup_checkpoints(self):
-        """Keep only the latest N checkpoints"""
         try:
             checkpoint_files = []
             for file in os.listdir(self.config.output_dir):
@@ -335,7 +289,6 @@ class IndicF5Trainer:
             
             checkpoint_files.sort(reverse=True)
             
-            # Keep only the latest max_checkpoints
             for epoch_num, file in checkpoint_files[self.config.max_checkpoints:]:
                 file_path = os.path.join(self.config.output_dir, file)
                 try:
@@ -358,13 +311,9 @@ class IndicF5Trainer:
         
         try:
             for epoch in range(self.config.num_epochs):
-                # Train
                 train_loss = self.train_epoch(epoch)
-                
-                # Validate
                 val_loss = self.validate()
                 
-                # Log results
                 logger.info(f"Epoch {epoch+1}/{self.config.num_epochs}")
                 logger.info(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
                 
@@ -378,7 +327,6 @@ class IndicF5Trainer:
                     except:
                         pass
                 
-                # Save checkpoint
                 is_best = val_loss < best_val_loss
                 if is_best:
                     best_val_loss = val_loss
@@ -401,7 +349,6 @@ class IndicF5Trainer:
         logger.info("Training completed!")
 
 def main():
-    # Check CUDA availability
     if torch.cuda.is_available():
         print(f"CUDA is available. Device: {torch.cuda.get_device_name(0)}")
         print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
