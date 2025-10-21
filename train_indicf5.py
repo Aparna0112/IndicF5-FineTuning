@@ -68,7 +68,7 @@ def train():
         conv_layers=4
     ).to(device)
     
-    tokenizer = get_tokenizer()
+    tokenizer = get_tokenizer('custom')
     
     # Load datasets
     print("Loading datasets...")
