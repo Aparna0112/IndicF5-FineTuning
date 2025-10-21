@@ -1,4 +1,4 @@
-# train.py - Fixed for transformers 4.50.3
+# train.py - Fixed for transformers 4.50.3 with meta tensor fix
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -49,20 +49,36 @@ class IndicF5Trainer:
         
         logger.info("Loading IndicF5 model...")
         try:
+            # Disable torch compile to avoid meta tensor issues
+            import torch._dynamo
+            torch._dynamo.config.suppress_errors = True
+            os.environ['TORCH_COMPILE_DISABLE'] = '1'
+            
+            # Load model without device_map to avoid meta tensor error
+            logger.info("Loading model from HuggingFace...")
             self.model = AutoModel.from_pretrained(
                 config.model_name, 
                 trust_remote_code=True,
-                torch_dtype=torch.float16 if config.fp16 and config.device.type == 'cuda' else torch.float32,
-                device_map="auto",
-                low_cpu_mem_usage=True
+                torch_dtype=torch.float32,
+                low_cpu_mem_usage=False
             )
             
+            logger.info("Moving model to device...")
+            self.model = self.model.to(config.device)
+            
+            # Convert to half precision if needed
+            if config.fp16 and config.device.type == 'cuda':
+                logger.info("Converting to FP16...")
+                self.model = self.model.half()
+            
+            # Try to load tokenizer
             try:
                 self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
             except Exception as e:
                 logger.warning(f"Could not load tokenizer: {e}")
                 self.tokenizer = None
             
+            # Enable gradient checkpointing
             if config.gradient_checkpointing and hasattr(self.model, 'gradient_checkpointing_enable'):
                 self.model.gradient_checkpointing_enable()
             
