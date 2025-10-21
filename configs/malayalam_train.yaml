@@ -1,0 +1,56 @@
+# configs/malayalam_train.yaml
+exp_name: malayalam_indicf5
+
+# Model configuration
+model_cls: DiT
+model:
+  dim: 1024
+  depth: 22
+  heads: 16
+  ff_mult: 2
+  text_dim: 512
+  conv_layers: 4
+
+# Vocoder
+vocoder_name: vocos
+
+# Training configuration
+batch_size_per_gpu: 4
+batch_size_type: frame
+max_samples: 64
+duration_predictor:
+  embed_dim: 512
+  depth: 8
+
+mel_spec_type: vocos
+mel_spec_kwargs:
+  n_fft: 1024
+  hop_length: 256
+  win_length: 1024
+  n_mel_channels: 100
+  target_sample_rate: 24000
+  normalize: false
+  center: false
+
+# Dataset
+dataset_name: custom
+data_dir: ./data/processed
+train_name: train
+val_name: test
+
+# Training parameters
+num_epochs: 15
+learning_rate: 5.0e-5
+warmup_steps: 300
+save_per_updates: 500
+last_per_updates: 500
+
+# Logging
+wandb_project: indicf5-malayalam
+wandb_run_name: malayalam-finetune
+log_samples: true
+
+# Device
+mixed_precision: fp16
+device: cuda
+num_workers: 4
