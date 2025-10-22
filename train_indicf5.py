@@ -1,4 +1,4 @@
-# train_indicf5.py - WORKING VERSION
+# train_indicf5.py - Complete Working Version
 import os
 os.environ['TORCH_COMPILE_DISABLE'] = '1'
 
@@ -14,30 +14,44 @@ from f5_tts.model import DiT
 
 class MalayalamDataset(Dataset):
     def __init__(self, csv_path):
-        # Updated column names
-        self.data = pd.read_csv(csv_path, sep='|', header=None, 
-                                names=['index', 'audio', 'transcript', 'speaker', 'duration'])
+        # CSV format: audio|text|speaker|duration (no header)
+        self.data = pd.read_csv(
+            csv_path, 
+            sep='|', 
+            header=None,
+            names=['audio', 'text', 'speaker', 'duration']
+        )
+        print(f"Loaded {len(self.data)} samples from {csv_path}")
+        print(f"First sample: {self.data.iloc[0]['audio']}")
         
     def __len__(self):
         return len(self.data)
     
     def __getitem__(self, idx):
         row = self.data.iloc[idx]
-        audio, sr = sf.read(row['audio'])
         
-        target_len = 192000
-        if len(audio) > target_len:
-            audio = audio[:target_len]
-        else:
-            audio = np.pad(audio, (0, target_len - len(audio)), mode='constant')
-        
-        text = str(row['transcript'])[:256]
-        text_indices = [ord(c) % 256 for c in text]
-        
-        return {
-            'audio': torch.FloatTensor(audio),
-            'text_indices': torch.LongTensor(text_indices)
-        }
+        try:
+            audio, sr = sf.read(row['audio'])
+            
+            target_len = 192000
+            if len(audio) > target_len:
+                audio = audio[:target_len]
+            else:
+                audio = np.pad(audio, (0, target_len - len(audio)), mode='constant')
+            
+            text = str(row['text'])[:256]
+            text_indices = [ord(c) % 256 for c in text]
+            
+            return {
+                'audio': torch.FloatTensor(audio),
+                'text_indices': torch.LongTensor(text_indices)
+            }
+        except Exception as e:
+            print(f"Error loading sample {idx} ({row['audio']}): {e}")
+            return {
+                'audio': torch.zeros(192000),
+                'text_indices': torch.LongTensor([0])
+            }
 
 def collate_fn(batch):
     audios = torch.stack([item['audio'] for item in batch])
@@ -63,8 +77,10 @@ def train():
     num_epochs = 15
     lr = 5e-5
     
-    print(f"Device: {device}")
+    print(f"\nDevice: {device}")
     print(f"Batch size: {batch_size}")
+    print(f"Learning rate: {lr}")
+    print(f"Epochs: {num_epochs}")
     
     print("\nInitializing model...")
     model = DiT(
@@ -89,12 +105,20 @@ def train():
         drop_last=True
     )
     
-    print(f"Train samples: {len(train_dataset)}")
+    print(f"Total batches per epoch: {len(train_loader)}")
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     scaler = torch.cuda.amp.GradScaler()
     
+    try:
+        wandb.init(project="indicf5-malayalam", name="f5tts-malayalam")
+        print("WandB initialized")
+    except:
+        print("WandB not initialized (optional)")
+    
     print("\nStarting training...")
+    print("="*60)
+    
     best_loss = float('inf')
     os.makedirs('./checkpoints/malayalam_f5', exist_ok=True)
     
@@ -111,9 +135,9 @@ def train():
                 text_indices = batch['text_indices'].to(device)
                 
                 bs = audios.shape[0]
-                seq_len = audios.shape[1] // 256  # Approximate sequence length after downsampling
+                seq_len = audios.shape[1] // 256
                 
-                # FIX: Create 3D conditioning tensor [B, T, D]
+                # Create 3D conditioning tensor [B, T, D]
                 cond = torch.randn(bs, seq_len, 512, device=device)
                 time = torch.rand(bs, device=device)
                 
@@ -146,43 +170,59 @@ def train():
                 total_loss += loss.item()
                 num_batches += 1
                 
-                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+                pbar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'avg': f'{total_loss/num_batches:.4f}'
+                })
                 
-                # Log every 100 batches
-                if batch_idx % 100 == 0:
-                    print(f"\nBatch {batch_idx}: Loss={loss.item():.4f}")
+                if batch_idx % 100 == 0 and batch_idx > 0:
+                    avg_so_far = total_loss / num_batches
+                    print(f"\n  Batch {batch_idx}/{len(train_loader)}: Loss={loss.item():.4f}, Avg={avg_so_far:.4f}")
                 
             except RuntimeError as e:
-                if "out of memory" in str(e):
-                    print(f"\n⚠️ OOM at batch {batch_idx}")
+                error_str = str(e)
+                if "out of memory" in error_str:
+                    print(f"\n⚠️ CUDA OOM at batch {batch_idx}, skipping...")
                     torch.cuda.empty_cache()
                     continue
                 else:
-                    print(f"\n❌ Error at batch {batch_idx}: {e}")
-                    if batch_idx < 5:  # Print details for first few errors
+                    print(f"\n❌ Runtime error at batch {batch_idx}: {error_str[:100]}")
+                    if batch_idx < 3:
                         import traceback
                         traceback.print_exc()
                     continue
             except Exception as e:
-                print(f"\n❌ Unexpected error: {e}")
+                print(f"\n❌ Error at batch {batch_idx}: {e}")
                 continue
         
         if num_batches == 0:
-            print("\n❌ No successful batches!")
+            print("\n❌ No successful batches in this epoch!")
             break
             
         avg_loss = total_loss / num_batches
-        print(f"\n✅ Epoch {epoch+1}/{num_epochs}: Loss={avg_loss:.4f} ({num_batches}/{len(train_loader)} batches)")
+        success_rate = (num_batches / len(train_loader)) * 100
+        
+        print(f"\n{'='*60}")
+        print(f"Epoch {epoch+1}/{num_epochs} Complete")
+        print(f"  Average Loss: {avg_loss:.4f}")
+        print(f"  Successful Batches: {num_batches}/{len(train_loader)} ({success_rate:.1f}%)")
+        print(f"{'='*60}")
         
         if avg_loss < best_loss:
             best_loss = avg_loss
-            torch.save({
+            checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': best_loss,
-            }, './checkpoints/malayalam_f5/best_model.pt')
-            print(f"💾 Saved best model: {best_loss:.4f}")
+                'config': {
+                    'dim': 512,
+                    'depth': 12,
+                    'heads': 8
+                }
+            }
+            torch.save(checkpoint, './checkpoints/malayalam_f5/best_model.pt')
+            print(f"💾 Saved best model! Loss: {best_loss:.4f}")
         
         # Save checkpoint every 5 epochs
         if (epoch + 1) % 5 == 0:
@@ -191,16 +231,31 @@ def train():
                 'model_state_dict': model.state_dict(),
                 'loss': avg_loss,
             }, f'./checkpoints/malayalam_f5/epoch_{epoch+1}.pt')
+            print(f"💾 Saved epoch {epoch+1} checkpoint")
+        
+        if wandb.run:
+            wandb.log({
+                'epoch': epoch,
+                'avg_loss': avg_loss,
+                'best_loss': best_loss,
+                'success_rate': success_rate
+            })
     
     print(f"\n{'='*60}")
-    print(f"✅ Training complete! Best loss: {best_loss:.4f}")
+    print("✅ Training Complete!")
     print(f"{'='*60}")
+    print(f"Best Loss: {best_loss:.4f}")
+    print(f"Checkpoints saved in: ./checkpoints/malayalam_f5/")
+    print(f"{'='*60}\n")
+    
+    if wandb.run:
+        wandb.finish()
 
 if __name__ == "__main__":
     try:
         train()
     except KeyboardInterrupt:
-        print("\n\n⚠️ Training interrupted")
+        print("\n\n⚠️ Training interrupted by user")
     except Exception as e:
         print(f"\n\n❌ Fatal error: {e}")
         import traceback
