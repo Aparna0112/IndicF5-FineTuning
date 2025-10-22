@@ -1,4 +1,4 @@
-# train_indicf5.py - PROPER F5-TTS TRAINING
+# train_indicf5.py - Fixed MelSpec
 import os
 os.environ['TORCH_COMPILE_DISABLE'] = '1'
 
@@ -10,9 +10,7 @@ from tqdm import tqdm
 import numpy as np
 import torchaudio
 
-# Use F5-TTS components properly
 from f5_tts.model import CFM
-from f5_tts.model.utils import get_tokenizer
 from f5_tts.model.modules import MelSpec
 
 class MalayalamDataset(Dataset):
@@ -29,13 +27,11 @@ class MalayalamDataset(Dataset):
         row = self.data.iloc[idx]
         audio, sr = sf.read(row['audio'])
         
-        # Resample to 24kHz if needed
         if sr != self.target_sr:
             audio = torchaudio.functional.resample(
                 torch.FloatTensor(audio), sr, self.target_sr
             ).numpy()
         
-        # Limit to 10 seconds
         max_len = self.target_sr * 10
         if len(audio) > max_len:
             audio = audio[:max_len]
@@ -44,15 +40,11 @@ class MalayalamDataset(Dataset):
         
         return {
             'audio': torch.FloatTensor(audio),
-            'text': text,
-            'duration': len(audio) / self.target_sr
+            'text': text
         }
 
 def collate_fn(batch):
-    # Sort by length for efficient padding
     batch = sorted(batch, key=lambda x: len(x['audio']), reverse=True)
-    
-    # Pad audios
     max_len = len(batch[0]['audio'])
     audios = []
     for item in batch:
@@ -63,17 +55,12 @@ def collate_fn(batch):
     
     audios = torch.stack(audios)
     texts = [item['text'] for item in batch]
-    durations = [item['duration'] for item in batch]
     
-    return {
-        'audios': audios,
-        'texts': texts,
-        'durations': durations
-    }
+    return {'audios': audios, 'texts': texts}
 
 def train():
     print("="*60)
-    print("Malayalam F5-TTS Training (Proper Method)")
+    print("Malayalam F5-TTS Training")
     print("="*60)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -84,18 +71,17 @@ def train():
     print(f"\nDevice: {device}")
     print(f"Batch size: {batch_size}")
     
-    # Initialize mel spectrogram converter
+    # Fixed MelSpec initialization
+    print("\nInitializing mel spectrogram...")
     mel_spec = MelSpec(
         n_fft=1024,
         hop_length=256,
         win_length=1024,
         n_mel_channels=100,
-        target_sample_rate=24000,
-        normalize=False
+        target_sample_rate=24000
     ).to(device)
     
-    # Initialize CFM model (not raw DiT)
-    print("\nInitializing CFM model...")
+    print("Initializing CFM model...")
     model = CFM(
         transformer=dict(
             dim=1024,
@@ -122,8 +108,8 @@ def train():
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
     
-    print(f"\nTotal batches: {len(train_loader)}")
-    print("\nStarting training...")
+    print(f"Total batches: {len(train_loader)}")
+    print("\nStarting training...\n")
     
     best_loss = float('inf')
     os.makedirs('./checkpoints/malayalam_cfm', exist_ok=True)
@@ -140,13 +126,11 @@ def train():
                 audios = batch['audios'].to(device)
                 texts = batch['texts']
                 
-                # Convert to mel spectrogram
                 with torch.no_grad():
                     mels = mel_spec(audios)
                 
                 optimizer.zero_grad()
                 
-                # CFM training
                 loss, _ = model(mels, texts)
                 
                 loss.backward()
@@ -156,18 +140,19 @@ def train():
                 total_loss += loss.item()
                 num_batches += 1
                 
-                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+                pbar.set_postfix({'loss': f'{loss.item():.4f}', 'avg': f'{total_loss/num_batches:.4f}'})
                 
-                if batch_idx == 0:
-                    print(f"\n  First batch successful! Loss: {loss.item():.4f}")
+                if batch_idx % 50 == 0 and batch_idx > 0:
+                    print(f"\n  Batch {batch_idx}: Loss={loss.item():.4f}, Avg={total_loss/num_batches:.4f}")
                 
             except RuntimeError as e:
                 if "out of memory" in str(e):
-                    print(f"\n⚠️ OOM, skipping batch")
+                    print(f"\n⚠️ OOM at batch {batch_idx}")
                     torch.cuda.empty_cache()
                     continue
                 else:
-                    print(f"\n❌ Error: {e}")
+                    if batch_idx < 3:
+                        print(f"\n❌ Error: {e}")
                     continue
         
         if num_batches == 0:
@@ -175,18 +160,43 @@ def train():
             break
         
         avg_loss = total_loss / num_batches
-        print(f"\n✅ Epoch {epoch+1}: Loss={avg_loss:.4f} ({num_batches} batches)")
+        success_rate = (num_batches / len(train_loader)) * 100
+        
+        print(f"\n{'='*60}")
+        print(f"✅ Epoch {epoch+1}/{num_epochs}")
+        print(f"   Loss: {avg_loss:.4f}")
+        print(f"   Success: {num_batches}/{len(train_loader)} ({success_rate:.1f}%)")
+        print(f"{'='*60}")
         
         if avg_loss < best_loss:
             best_loss = avg_loss
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
                 'loss': best_loss
             }, './checkpoints/malayalam_cfm/best_model.pt')
-            print(f"💾 Saved best: {best_loss:.4f}")
+            print(f"💾 Saved best model: {best_loss:.4f}")
+        
+        if (epoch + 1) % 5 == 0:
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'loss': avg_loss
+            }, f'./checkpoints/malayalam_cfm/epoch_{epoch+1}.pt')
     
-    print(f"\n✅ Training complete! Best: {best_loss:.4f}")
+    print(f"\n{'='*60}")
+    print(f"✅ Training Complete!")
+    print(f"   Best Loss: {best_loss:.4f}")
+    print(f"   Checkpoints: ./checkpoints/malayalam_cfm/")
+    print(f"{'='*60}")
 
 if __name__ == "__main__":
-    train()
+    try:
+        train()
+    except KeyboardInterrupt:
+        print("\n⚠️ Training interrupted")
+    except Exception as e:
+        print(f"\n❌ Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
