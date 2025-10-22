@@ -1,4 +1,4 @@
-# train_indicf5.py - CORRECT CFM INITIALIZATION
+# train_indicf5.py - CORRECT INITIALIZATION
 import os
 os.environ['TORCH_COMPILE_DISABLE'] = '1'
 
@@ -38,10 +38,7 @@ class MalayalamDataset(Dataset):
         
         text = str(row['text'])
         
-        return {
-            'audio': torch.FloatTensor(audio),
-            'text': text
-        }
+        return {'audio': torch.FloatTensor(audio), 'text': text}
 
 def collate_fn(batch):
     batch = sorted(batch, key=lambda x: len(x['audio']), reverse=True)
@@ -71,19 +68,18 @@ def train():
     print(f"\nDevice: {device}")
     print(f"Batch size: {batch_size}")
     
-    # Initialize components
-    print("\nInitializing model components...")
+    print("\nInitializing model...")
     
-    # Mel spectrogram converter
+    # Mel spectrogram
     mel_spec = MelSpec(
         n_fft=1024,
         hop_length=256,
         win_length=1024,
         n_mel_channels=100,
         target_sample_rate=24000
-    ).to(device)
+    )
     
-    # Transformer backbone
+    # DiT transformer
     transformer = DiT(
         dim=1024,
         depth=22,
@@ -93,14 +89,19 @@ def train():
         conv_layers=4
     )
     
-    # CFM model (Correct initialization)
+    # CFM with CORRECT parameters
     model = CFM(
         transformer=transformer,
         sigma=0.0,
-        estimator="nll"
+        mel_spec_module=mel_spec,
+        odeint_kwargs={'method': 'euler'},
+        audio_drop_prob=0.3,
+        cond_drop_prob=0.2
     ).to(device)
     
-    print("Loading dataset...")
+    print("✓ Model initialized successfully")
+    
+    print("\nLoading dataset...")
     train_dataset = MalayalamDataset('./data/f5_format/train.csv')
     train_loader = DataLoader(
         train_dataset,
@@ -132,14 +133,10 @@ def train():
                 audios = batch['audios'].to(device)
                 texts = batch['texts']
                 
-                # Convert to mel spectrogram
-                with torch.no_grad():
-                    mels = mel_spec(audios)
-                
                 optimizer.zero_grad()
                 
-                # CFM forward pass
-                loss, _ = model(mels, texts)
+                # CFM handles mel conversion internally now
+                loss, _ = model(audios, texts)
                 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -150,8 +147,11 @@ def train():
                 
                 pbar.set_postfix({'loss': f'{loss.item():.4f}', 'avg': f'{total_loss/num_batches:.4f}'})
                 
+                if batch_idx == 0:
+                    print(f"\n✓ First batch successful! Loss: {loss.item():.4f}")
+                
                 if batch_idx % 50 == 0 and batch_idx > 0:
-                    print(f"\n  Batch {batch_idx}: Loss={loss.item():.4f}")
+                    print(f"\n  Batch {batch_idx}: Loss={loss.item():.4f}, Avg={total_loss/num_batches:.4f}")
                 
             except RuntimeError as e:
                 if "out of memory" in str(e):
@@ -161,12 +161,10 @@ def train():
                 else:
                     if batch_idx < 3:
                         print(f"\n❌ Error: {e}")
-                        import traceback
-                        traceback.print_exc()
                     continue
             except Exception as e:
                 if batch_idx < 3:
-                    print(f"\n❌ Unexpected error: {e}")
+                    print(f"\n❌ Unexpected: {e}")
                     import traceback
                     traceback.print_exc()
                 continue
