@@ -1,4 +1,4 @@
-# train_indicf5.py - ROBUST VERSION
+# train_indicf5.py - FINAL FIX WITH DEBUGGING
 import os
 os.environ['TORCH_COMPILE_DISABLE'] = '1'
 
@@ -16,49 +16,31 @@ class MalayalamDataset(Dataset):
     def __init__(self, csv_path):
         self.data = pd.read_csv(csv_path, sep='|', header=None, 
                                 names=['audio', 'text', 'speaker', 'duration'])
-        # Filter valid entries
-        self.data = self.data[self.data['audio'].notna()]
         
     def __len__(self):
         return len(self.data)
     
     def __getitem__(self, idx):
         row = self.data.iloc[idx]
+        audio, sr = sf.read(row['audio'])
         
-        try:
-            audio, sr = sf.read(row['audio'])
-            
-            target_len = 192000
-            if len(audio) > target_len:
-                audio = audio[:target_len]
-            else:
-                padding = target_len - len(audio)
-                audio = np.pad(audio, (0, padding), mode='constant')
-            
-            text = str(row['text'])[:256]  # Limit text length
-            text_indices = [ord(c) % 256 for c in text]
-            
-            return {
-                'audio': torch.FloatTensor(audio),
-                'text_indices': torch.LongTensor(text_indices)
-            }
-        except Exception as e:
-            print(f"Error loading sample {idx}: {e}")
-            # Return dummy data
-            return {
-                'audio': torch.zeros(192000),
-                'text_indices': torch.LongTensor([0])
-            }
+        target_len = 192000
+        if len(audio) > target_len:
+            audio = audio[:target_len]
+        else:
+            audio = np.pad(audio, (0, target_len - len(audio)), mode='constant')
+        
+        text = str(row['text'])[:256]
+        text_indices = [ord(c) % 256 for c in text]
+        
+        return {
+            'audio': torch.FloatTensor(audio),
+            'text_indices': torch.LongTensor(text_indices)
+        }
 
 def collate_fn(batch):
-    # Filter out None/invalid samples
-    batch = [b for b in batch if b is not None]
-    if len(batch) == 0:
-        return None
-    
     audios = torch.stack([item['audio'] for item in batch])
     
-    # Pad text to same length
     max_len = max(len(item['text_indices']) for item in batch)
     text_list = []
     for item in batch:
@@ -68,7 +50,6 @@ def collate_fn(batch):
         text_list.append(indices)
     
     text_indices = torch.stack(text_list)
-    
     return {'audios': audios, 'text_indices': text_indices}
 
 def train():
@@ -77,11 +58,11 @@ def train():
     print("="*60)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    batch_size = 4  # Increased batch size
+    batch_size = 4
     num_epochs = 15
     lr = 5e-5
     
-    print(f"\nDevice: {device}")
+    print(f"Device: {device}")
     print(f"Batch size: {batch_size}")
     
     print("\nInitializing model...")
@@ -104,23 +85,41 @@ def train():
         collate_fn=collate_fn,
         num_workers=2,
         pin_memory=True,
-        drop_last=True  # Drop incomplete batches
+        drop_last=True
     )
     
     print(f"Train samples: {len(train_dataset)}")
-    print(f"Batches per epoch: {len(train_loader)}")
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     scaler = torch.cuda.amp.GradScaler()
-    
-    try:
-        wandb.init(project="indicf5-malayalam", name="f5tts-malayalam")
-    except:
-        print("WandB not initialized")
     
     print("\nStarting training...")
     best_loss = float('inf')
     os.makedirs('./checkpoints/malayalam_f5', exist_ok=True)
+    
+    # DEBUG: Test one batch first
+    test_batch = next(iter(train_loader))
+    test_audios = test_batch['audios'].to(device)
+    test_text = test_batch['text_indices'].to(device)
+    
+    print(f"\nDEBUG - Input shapes:")
+    print(f"  Audios: {test_audios.shape}")
+    print(f"  Text: {test_text.shape}")
+    
+    with torch.no_grad():
+        x_test = test_audios.unsqueeze(1)
+        print(f"  X (with channel): {x_test.shape}")
+        
+        test_out = model(
+            x=x_test,
+            cond=torch.randn(batch_size, 512, device=device),
+            text=test_text,
+            time=torch.rand(batch_size, device=device)
+        )
+        print(f"  Model output: {test_out.shape}")
+        print(f"  Expected target: {x_test.shape}")
+    
+    print("\nStarting actual training...\n")
     
     for epoch in range(num_epochs):
         model.train()
@@ -130,9 +129,6 @@ def train():
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
         
         for batch_idx, batch in enumerate(pbar):
-            if batch is None:
-                continue
-                
             try:
                 audios = batch['audios'].to(device)
                 text_indices = batch['text_indices'].to(device)
@@ -144,20 +140,23 @@ def train():
                 optimizer.zero_grad()
                 
                 with torch.cuda.amp.autocast():
-                    # Ensure correct input shape: [batch, channels, length]
-                    x = audios.unsqueeze(1) if audios.dim() == 2 else audios
+                    x = audios.unsqueeze(1)  # [B, 1, L]
                     
-                    outputs = model(
-                        x=x,
-                        cond=cond,
-                        text=text_indices,
-                        time=time
-                    )
+                    outputs = model(x=x, cond=cond, text=text_indices, time=time)
                     
-                    # Ensure output and target have same shape
-                    if outputs.dim() != x.dim():
+                    # FIX: Match dimensions
+                    if outputs.shape != x.shape:
+                        # If output is [B, L], add channel dimension
                         if outputs.dim() == 2:
                             outputs = outputs.unsqueeze(1)
+                        # If output is [B, C, L] but C != 1, take first channel
+                        elif outputs.shape[1] != 1:
+                            outputs = outputs[:, :1, :]
+                        # If lengths don't match, truncate/pad
+                        if outputs.shape[2] != x.shape[2]:
+                            min_len = min(outputs.shape[2], x.shape[2])
+                            outputs = outputs[:, :, :min_len]
+                            x = x[:, :, :min_len]
                     
                     loss = torch.nn.functional.mse_loss(outputs, x)
                 
@@ -170,25 +169,16 @@ def train():
                 total_loss += loss.item()
                 num_batches += 1
                 
-                pbar.set_postfix({'loss': f'{loss.item():.4f}', 'batches': num_batches})
+                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
                 
-                if wandb.run and batch_idx % 50 == 0:
-                    wandb.log({'train_loss': loss.item(), 'step': epoch * len(train_loader) + batch_idx})
-                
-            except RuntimeError as e:
-                error_msg = str(e)
-                if "out of memory" in error_msg:
-                    print(f"\n⚠️ OOM at batch {batch_idx}, clearing cache...")
+            except Exception as e:
+                if "out of memory" in str(e):
                     torch.cuda.empty_cache()
                     continue
-                elif "dimension" in error_msg or "shape" in error_msg:
-                    print(f"\n⚠️ Shape error at batch {batch_idx}: {error_msg}")
-                    continue
-                else:
-                    print(f"\n❌ Runtime error: {error_msg}")
-                    continue
-            except Exception as e:
-                print(f"\n❌ Error at batch {batch_idx}: {e}")
+                elif batch_idx == 0:  # Only print error for first batch
+                    print(f"\nError: {e}")
+                    import traceback
+                    traceback.print_exc()
                 continue
         
         if num_batches == 0:
@@ -196,38 +186,18 @@ def train():
             break
             
         avg_loss = total_loss / num_batches
-        print(f"\n✅ Epoch {epoch+1}: Loss={avg_loss:.4f} ({num_batches} batches)")
+        print(f"\n✅ Epoch {epoch+1}: Loss={avg_loss:.4f} ({num_batches} successful batches)")
         
         if avg_loss < best_loss:
             best_loss = avg_loss
-            checkpoint = {
+            torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
                 'loss': best_loss,
-            }
-            torch.save(checkpoint, './checkpoints/malayalam_f5/best_model.pt')
+            }, './checkpoints/malayalam_f5/best_model.pt')
             print(f"💾 Saved best: {best_loss:.4f}")
-        
-        if (epoch + 1) % 5 == 0:
-            torch.save(checkpoint, f'./checkpoints/malayalam_f5/epoch_{epoch+1}.pt')
-        
-        if wandb.run:
-            wandb.log({'epoch': epoch, 'avg_loss': avg_loss, 'best_loss': best_loss})
     
-    print("\n" + "="*60)
-    print(f"✅ Training complete! Best loss: {best_loss:.4f}")
-    print("="*60)
-    
-    if wandb.run:
-        wandb.finish()
+    print(f"\n✅ Complete! Best: {best_loss:.4f}")
 
 if __name__ == "__main__":
-    try:
-        train()
-    except KeyboardInterrupt:
-        print("\n\n⚠️ Training interrupted by user")
-    except Exception as e:
-        print(f"\n\n❌ Fatal error: {e}")
-        import traceback
-        traceback.print_exc()
+    train()
