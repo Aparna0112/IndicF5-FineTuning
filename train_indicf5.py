@@ -1,4 +1,4 @@
-# train_indicf5.py - FINAL FIX WITH DEBUGGING
+# train_indicf5.py - WORKING VERSION
 import os
 os.environ['TORCH_COMPILE_DISABLE'] = '1'
 
@@ -14,8 +14,9 @@ from f5_tts.model import DiT
 
 class MalayalamDataset(Dataset):
     def __init__(self, csv_path):
+        # Updated column names
         self.data = pd.read_csv(csv_path, sep='|', header=None, 
-                                names=['audio', 'text', 'speaker', 'duration'])
+                                names=['index', 'audio', 'transcript', 'speaker', 'duration'])
         
     def __len__(self):
         return len(self.data)
@@ -30,7 +31,7 @@ class MalayalamDataset(Dataset):
         else:
             audio = np.pad(audio, (0, target_len - len(audio)), mode='constant')
         
-        text = str(row['text'])[:256]
+        text = str(row['transcript'])[:256]
         text_indices = [ord(c) % 256 for c in text]
         
         return {
@@ -97,30 +98,6 @@ def train():
     best_loss = float('inf')
     os.makedirs('./checkpoints/malayalam_f5', exist_ok=True)
     
-    # DEBUG: Test one batch first
-    test_batch = next(iter(train_loader))
-    test_audios = test_batch['audios'].to(device)
-    test_text = test_batch['text_indices'].to(device)
-    
-    print(f"\nDEBUG - Input shapes:")
-    print(f"  Audios: {test_audios.shape}")
-    print(f"  Text: {test_text.shape}")
-    
-    with torch.no_grad():
-        x_test = test_audios.unsqueeze(1)
-        print(f"  X (with channel): {x_test.shape}")
-        
-        test_out = model(
-            x=x_test,
-            cond=torch.randn(batch_size, 512, device=device),
-            text=test_text,
-            time=torch.rand(batch_size, device=device)
-        )
-        print(f"  Model output: {test_out.shape}")
-        print(f"  Expected target: {x_test.shape}")
-    
-    print("\nStarting actual training...\n")
-    
     for epoch in range(num_epochs):
         model.train()
         total_loss = 0
@@ -134,7 +111,10 @@ def train():
                 text_indices = batch['text_indices'].to(device)
                 
                 bs = audios.shape[0]
-                cond = torch.randn(bs, 512, device=device)
+                seq_len = audios.shape[1] // 256  # Approximate sequence length after downsampling
+                
+                # FIX: Create 3D conditioning tensor [B, T, D]
+                cond = torch.randn(bs, seq_len, 512, device=device)
                 time = torch.rand(bs, device=device)
                 
                 optimizer.zero_grad()
@@ -144,15 +124,12 @@ def train():
                     
                     outputs = model(x=x, cond=cond, text=text_indices, time=time)
                     
-                    # FIX: Match dimensions
+                    # Match dimensions
                     if outputs.shape != x.shape:
-                        # If output is [B, L], add channel dimension
                         if outputs.dim() == 2:
                             outputs = outputs.unsqueeze(1)
-                        # If output is [B, C, L] but C != 1, take first channel
                         elif outputs.shape[1] != 1:
                             outputs = outputs[:, :1, :]
-                        # If lengths don't match, truncate/pad
                         if outputs.shape[2] != x.shape[2]:
                             min_len = min(outputs.shape[2], x.shape[2])
                             outputs = outputs[:, :, :min_len]
@@ -171,14 +148,23 @@ def train():
                 
                 pbar.set_postfix({'loss': f'{loss.item():.4f}'})
                 
-            except Exception as e:
+                # Log every 100 batches
+                if batch_idx % 100 == 0:
+                    print(f"\nBatch {batch_idx}: Loss={loss.item():.4f}")
+                
+            except RuntimeError as e:
                 if "out of memory" in str(e):
+                    print(f"\n⚠️ OOM at batch {batch_idx}")
                     torch.cuda.empty_cache()
                     continue
-                elif batch_idx == 0:  # Only print error for first batch
-                    print(f"\nError: {e}")
-                    import traceback
-                    traceback.print_exc()
+                else:
+                    print(f"\n❌ Error at batch {batch_idx}: {e}")
+                    if batch_idx < 5:  # Print details for first few errors
+                        import traceback
+                        traceback.print_exc()
+                    continue
+            except Exception as e:
+                print(f"\n❌ Unexpected error: {e}")
                 continue
         
         if num_batches == 0:
@@ -186,18 +172,36 @@ def train():
             break
             
         avg_loss = total_loss / num_batches
-        print(f"\n✅ Epoch {epoch+1}: Loss={avg_loss:.4f} ({num_batches} successful batches)")
+        print(f"\n✅ Epoch {epoch+1}/{num_epochs}: Loss={avg_loss:.4f} ({num_batches}/{len(train_loader)} batches)")
         
         if avg_loss < best_loss:
             best_loss = avg_loss
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
                 'loss': best_loss,
             }, './checkpoints/malayalam_f5/best_model.pt')
-            print(f"💾 Saved best: {best_loss:.4f}")
+            print(f"💾 Saved best model: {best_loss:.4f}")
+        
+        # Save checkpoint every 5 epochs
+        if (epoch + 1) % 5 == 0:
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'loss': avg_loss,
+            }, f'./checkpoints/malayalam_f5/epoch_{epoch+1}.pt')
     
-    print(f"\n✅ Complete! Best: {best_loss:.4f}")
+    print(f"\n{'='*60}")
+    print(f"✅ Training complete! Best loss: {best_loss:.4f}")
+    print(f"{'='*60}")
 
 if __name__ == "__main__":
-    train()
+    try:
+        train()
+    except KeyboardInterrupt:
+        print("\n\n⚠️ Training interrupted")
+    except Exception as e:
+        print(f"\n\n❌ Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
