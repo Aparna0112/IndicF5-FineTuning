@@ -1,4 +1,4 @@
-# train_indicf5.py - CORRECT INITIALIZATION
+# train_indicf5.py - FINAL WORKING VERSION
 import os
 os.environ['TORCH_COMPILE_DISABLE'] = '1'
 
@@ -67,6 +67,8 @@ def train():
     
     print(f"\nDevice: {device}")
     print(f"Batch size: {batch_size}")
+    print(f"Learning rate: {lr}")
+    print(f"Epochs: {num_epochs}")
     
     print("\nInitializing model...")
     
@@ -89,7 +91,7 @@ def train():
         conv_layers=4
     )
     
-    # CFM with CORRECT parameters
+    # CFM model
     model = CFM(
         transformer=transformer,
         sigma=0.0,
@@ -115,8 +117,9 @@ def train():
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
     
-    print(f"Total batches: {len(train_loader)}")
-    print("\nStarting training...\n")
+    print(f"Total batches per epoch: {len(train_loader)}")
+    print("\nStarting training...")
+    print("="*60 + "\n")
     
     best_loss = float('inf')
     os.makedirs('./checkpoints/malayalam_cfm', exist_ok=True)
@@ -135,8 +138,12 @@ def train():
                 
                 optimizer.zero_grad()
                 
-                # CFM handles mel conversion internally now
-                loss = model(audios, texts)
+                # FIXED: Handle tuple return
+                output = model(audios, texts)
+                if isinstance(output, tuple):
+                    loss = output[0]
+                else:
+                    loss = output
                 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -145,73 +152,88 @@ def train():
                 total_loss += loss.item()
                 num_batches += 1
                 
-                pbar.set_postfix({'loss': f'{loss.item():.4f}', 'avg': f'{total_loss/num_batches:.4f}'})
+                pbar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'avg': f'{total_loss/num_batches:.4f}'
+                })
                 
                 if batch_idx == 0:
                     print(f"\n✓ First batch successful! Loss: {loss.item():.4f}")
                 
                 if batch_idx % 50 == 0 and batch_idx > 0:
-                    print(f"\n  Batch {batch_idx}: Loss={loss.item():.4f}, Avg={total_loss/num_batches:.4f}")
+                    print(f"\n  Batch {batch_idx}/{len(train_loader)}: Loss={loss.item():.4f}, Avg={total_loss/num_batches:.4f}")
                 
             except RuntimeError as e:
                 if "out of memory" in str(e):
-                    print(f"\n⚠️ OOM at batch {batch_idx}")
+                    print(f"\n⚠️ CUDA OOM at batch {batch_idx}, clearing cache...")
                     torch.cuda.empty_cache()
                     continue
                 else:
                     if batch_idx < 3:
-                        print(f"\n❌ Error: {e}")
+                        print(f"\n❌ Runtime error at batch {batch_idx}: {e}")
                     continue
             except Exception as e:
                 if batch_idx < 3:
-                    print(f"\n❌ Unexpected: {e}")
+                    print(f"\n❌ Unexpected error at batch {batch_idx}: {e}")
                     import traceback
                     traceback.print_exc()
                 continue
         
         if num_batches == 0:
-            print("\n❌ No successful batches!")
+            print("\n❌ No successful batches in this epoch!")
             break
         
         avg_loss = total_loss / num_batches
         success_rate = (num_batches / len(train_loader)) * 100
         
         print(f"\n{'='*60}")
-        print(f"✅ Epoch {epoch+1}/{num_epochs}")
-        print(f"   Loss: {avg_loss:.4f}")
-        print(f"   Success: {num_batches}/{len(train_loader)} ({success_rate:.1f}%)")
+        print(f"✅ Epoch {epoch+1}/{num_epochs} Complete")
         print(f"{'='*60}")
+        print(f"  Average Loss: {avg_loss:.4f}")
+        print(f"  Successful Batches: {num_batches}/{len(train_loader)} ({success_rate:.1f}%)")
+        print(f"{'='*60}\n")
         
         if avg_loss < best_loss:
             best_loss = avg_loss
-            torch.save({
+            checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'loss': best_loss
-            }, './checkpoints/malayalam_cfm/best_model.pt')
-            print(f"💾 Saved best model: {best_loss:.4f}")
+                'loss': best_loss,
+                'config': {
+                    'batch_size': batch_size,
+                    'learning_rate': lr,
+                    'model': 'CFM+DiT'
+                }
+            }
+            torch.save(checkpoint, './checkpoints/malayalam_cfm/best_model.pt')
+            print(f"💾 Saved best model! Loss: {best_loss:.4f}\n")
         
         if (epoch + 1) % 5 == 0:
-            torch.save({
+            checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
                 'loss': avg_loss
-            }, f'./checkpoints/malayalam_cfm/epoch_{epoch+1}.pt')
-            print(f"💾 Saved epoch {epoch+1} checkpoint")
+            }
+            torch.save(checkpoint, f'./checkpoints/malayalam_cfm/epoch_{epoch+1}.pt')
+            print(f"💾 Saved epoch {epoch+1} checkpoint\n")
     
     print(f"\n{'='*60}")
-    print(f"✅ Training Complete!")
-    print(f"   Best Loss: {best_loss:.4f}")
-    print(f"   Checkpoints: ./checkpoints/malayalam_cfm/")
+    print(f"🎉 Training Complete!")
     print(f"{'='*60}")
+    print(f"  Best Loss: {best_loss:.4f}")
+    print(f"  Checkpoints saved in: ./checkpoints/malayalam_cfm/")
+    print(f"  Total epochs completed: {epoch+1}")
+    print(f"{'='*60}\n")
 
 if __name__ == "__main__":
     try:
         train()
     except KeyboardInterrupt:
-        print("\n⚠️ Training interrupted")
+        print("\n\n⚠️ Training interrupted by user")
+        print("Checkpoints have been saved.")
     except Exception as e:
-        print(f"\n❌ Fatal error: {e}")
+        print(f"\n\n❌ Fatal error occurred: {e}")
         import traceback
         traceback.print_exc()
