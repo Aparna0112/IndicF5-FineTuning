@@ -1,4 +1,4 @@
-# train_indicf5.py - FINAL WORKING VERSION
+# train_indicf5.py - DEBUG VERSION
 import os
 os.environ['TORCH_COMPILE_DISABLE'] = '1'
 
@@ -59,7 +59,7 @@ def collate_fn(batch):
 
 def train():
     print("="*60)
-    print("Malayalam F5-TTS Training")
+    print("Malayalam F5-TTS Training - DEBUG MODE")
     print("="*60)
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -83,12 +83,7 @@ def train():
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     scaler = torch.cuda.amp.GradScaler()
     
-    try:
-        wandb.init(project="indicf5-malayalam", name="f5tts-malayalam")
-    except:
-        print("WandB not initialized")
-    
-    print("\nStarting training...")
+    print("\nStarting training (DEBUG MODE - will show all errors)...")
     best_loss = float('inf')
     os.makedirs('./checkpoints/malayalam_f5', exist_ok=True)
     
@@ -100,35 +95,57 @@ def train():
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")
         
         for batch_idx, batch in enumerate(pbar):
+            print(f"\n{'='*60}")
+            print(f"Processing Batch {batch_idx}")
+            print(f"{'='*60}")
+            
             try:
                 audios = batch['audios'].to(device)
                 text_indices = batch['text_indices'].to(device)
                 
                 bs = audios.shape[0]
-                
-                # FIXED: Use constant seq_len that matches model architecture
                 seq_len = 750
                 cond = torch.randn(bs, seq_len, 512, device=device)
                 time = torch.rand(bs, device=device)
                 
+                print(f"Input shapes:")
+                print(f"  audios: {audios.shape}")
+                print(f"  text_indices: {text_indices.shape}")
+                print(f"  cond: {cond.shape}")
+                print(f"  time: {time.shape}")
+                
                 optimizer.zero_grad()
                 
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     x = audios.unsqueeze(1)
+                    print(f"  x (with channel): {x.shape}")
+                    
+                    print(f"Calling model.forward()...")
                     outputs = model(x=x, cond=cond, text=text_indices, time=time)
+                    print(f"  outputs: {outputs.shape}")
                     
                     if outputs.shape != x.shape:
+                        print(f"Shape mismatch detected!")
+                        print(f"  Before adjustment - outputs: {outputs.shape}, x: {x.shape}")
+                        
                         if outputs.dim() == 2:
                             outputs = outputs.unsqueeze(1)
+                            print(f"  Added channel dimension: {outputs.shape}")
                         elif outputs.shape[1] != 1:
                             outputs = outputs[:, :1, :]
+                            print(f"  Took first channel: {outputs.shape}")
+                        
                         if outputs.shape[2] != x.shape[2]:
                             min_len = min(outputs.shape[2], x.shape[2])
                             outputs = outputs[:, :, :min_len]
                             x = x[:, :, :min_len]
+                            print(f"  Matched length: outputs={outputs.shape}, x={x.shape}")
                     
+                    print(f"Computing loss...")
                     loss = torch.nn.functional.mse_loss(outputs, x)
+                    print(f"  ✓ Loss: {loss.item():.4f}")
                 
+                print(f"Backward pass...")
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -138,14 +155,32 @@ def train():
                 total_loss += loss.item()
                 num_batches += 1
                 
-                pbar.set_postfix({'loss': f'{loss.item():.4f}', 'avg': f'{total_loss/num_batches:.4f}'})
+                print(f"✓ Batch {batch_idx} completed successfully!")
+                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+                
+                # Test only first 3 batches in debug mode
+                if batch_idx >= 2:
+                    print(f"\n{'='*60}")
+                    print(f"DEBUG MODE: Stopping after 3 batches")
+                    print(f"{'='*60}")
+                    break
                 
             except RuntimeError as e:
+                print(f"\n❌ RuntimeError in batch {batch_idx}:")
+                print(f"   {e}")
                 if "out of memory" in str(e):
+                    print(f"   -> CUDA Out of Memory")
                     torch.cuda.empty_cache()
-                    continue
+                import traceback
+                traceback.print_exc()
                 continue
+                
             except Exception as e:
+                print(f"\n❌ Exception in batch {batch_idx}:")
+                print(f"   Type: {type(e).__name__}")
+                print(f"   Message: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
         
         if num_batches == 0:
@@ -153,7 +188,9 @@ def train():
             break
             
         avg_loss = total_loss / num_batches
-        print(f"\n✅ Epoch {epoch+1}: Loss={avg_loss:.4f} ({num_batches}/{len(train_loader)} batches)")
+        print(f"\n{'='*60}")
+        print(f"✅ Epoch {epoch+1}: Loss={avg_loss:.4f} ({num_batches} successful batches)")
+        print(f"{'='*60}")
         
         if avg_loss < best_loss:
             best_loss = avg_loss
@@ -161,13 +198,13 @@ def train():
                        'loss': best_loss}, './checkpoints/malayalam_f5/best_model.pt')
             print(f"💾 Saved best: {best_loss:.4f}")
         
-        if (epoch + 1) % 5 == 0:
-            torch.save({'epoch': epoch, 'model_state_dict': model.state_dict()},
-                      f'./checkpoints/malayalam_f5/epoch_{epoch+1}.pt')
+        # In debug mode, only run 1 epoch
+        print(f"\nDEBUG MODE: Stopping after 1 epoch")
+        break
     
-    print(f"\n✅ Complete! Best: {best_loss:.4f}")
-    if wandb.run:
-        wandb.finish()
+    print(f"\n{'='*60}")
+    print(f"✅ DEBUG Complete! Best: {best_loss:.4f}")
+    print(f"{'='*60}")
 
 if __name__ == "__main__":
     try:
@@ -175,6 +212,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n⚠️ Interrupted")
     except Exception as e:
-        print(f"\n❌ Error: {e}")
+        print(f"\n❌ Fatal Error: {e}")
         import traceback
         traceback.print_exc()
