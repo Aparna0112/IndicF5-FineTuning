@@ -1,4 +1,4 @@
-# train_indicf5.py - FINAL FIXED VERSION
+# train_indicf5.py - WORKING VERSION
 import os
 os.environ['TORCH_COMPILE_DISABLE'] = '1'
 
@@ -31,30 +31,36 @@ class MalayalamDataset(Dataset):
             padding = target_len - len(audio)
             audio = np.pad(audio, (0, padding), mode='constant')
         
+        # Convert text to character indices (Long type)
+        text = row['text']
+        text_indices = [ord(c) % 256 for c in text[:256]]  # Limit to 256 chars
+        
         return {
             'audio': torch.FloatTensor(audio),
-            'text': row['text']
+            'text_indices': torch.LongTensor(text_indices),
+            'text': text
         }
 
 def collate_fn(batch):
     audios = torch.stack([item['audio'] for item in batch])
+    
+    # Pad text indices to same length
+    max_text_len = max(len(item['text_indices']) for item in batch)
+    text_indices_list = []
+    
+    for item in batch:
+        indices = item['text_indices']
+        # Pad with zeros
+        padded = torch.nn.functional.pad(indices, (0, max_text_len - len(indices)), value=0)
+        text_indices_list.append(padded)
+    
+    text_indices = torch.stack(text_indices_list)
     texts = [item['text'] for item in batch]
-    
-    max_text_len = max(len(t) for t in texts)
-    text_embeds = []
-    
-    for text in texts:
-        chars = [ord(c) % 256 for c in text]
-        chars = chars + [0] * (max_text_len - len(chars))
-        text_embeds.append(chars[:256])
-    
-    # FIXED: Explicitly create LongTensor
-    text_tensor = torch.LongTensor(text_embeds)
     
     return {
         'audios': audios,
-        'texts': texts,
-        'text_embeds': text_tensor
+        'text_indices': text_indices,
+        'texts': texts
     }
 
 def train():
@@ -80,8 +86,6 @@ def train():
         conv_layers=2
     ).to(device)
     
-    text_embed_layer = torch.nn.Embedding(256, 256).to(device)
-    
     print("Loading datasets...")
     train_dataset = MalayalamDataset('./data/f5_format/train.csv')
     val_dataset = MalayalamDataset('./data/f5_format/test.csv')
@@ -91,7 +95,8 @@ def train():
         batch_size=batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=2
+        num_workers=2,
+        pin_memory=True
     )
     
     val_loader = DataLoader(
@@ -104,10 +109,7 @@ def train():
     print(f"Train samples: {len(train_dataset)}")
     print(f"Val samples: {len(val_dataset)}")
     
-    optimizer = torch.optim.AdamW(
-        list(model.parameters()) + list(text_embed_layer.parameters()), 
-        lr=lr
-    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     
     try:
         wandb.init(project="indicf5-malayalam", name="f5tts-malayalam")
@@ -120,7 +122,6 @@ def train():
     
     for epoch in range(num_epochs):
         model.train()
-        text_embed_layer.train()
         total_loss = 0
         num_batches = 0
         
@@ -129,14 +130,10 @@ def train():
         for batch_idx, batch in enumerate(pbar):
             try:
                 audios = batch['audios'].to(device)
-                # FIXED: Ensure Long type before sending to device
-                text_indices = batch['text_embeds'].to(device)
+                text_indices = batch['text_indices'].to(device)
                 
-                # Verify type
-                if text_indices.dtype != torch.long:
-                    text_indices = text_indices.long()
-                
-                text_embeds = text_embed_layer(text_indices)
+                # Verify text_indices are Long type
+                assert text_indices.dtype == torch.long, f"Expected Long, got {text_indices.dtype}"
                 
                 batch_size_actual = audios.shape[0]
                 cond = torch.randn(batch_size_actual, 512).to(device)
@@ -144,10 +141,11 @@ def train():
                 
                 optimizer.zero_grad()
                 
+                # Pass text_indices directly - DiT will handle embedding internally
                 outputs = model(
                     x=audios.unsqueeze(1),
                     cond=cond,
-                    text=text_embeds,
+                    text=text_indices,  # Pass indices, not embeddings
                     time=time
                 )
                 
@@ -155,10 +153,7 @@ def train():
                 loss = torch.nn.functional.mse_loss(outputs, target)
                 
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    list(model.parameters()) + list(text_embed_layer.parameters()), 
-                    1.0
-                )
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 
                 total_loss += loss.item()
@@ -166,52 +161,54 @@ def train():
                 
                 pbar.set_postfix({'loss': f'{loss.item():.4f}'})
                 
-                if wandb.run:
-                    wandb.log({'train_loss': loss.item(), 'step': epoch * len(train_loader) + batch_idx})
+                if wandb.run and batch_idx % 10 == 0:
+                    wandb.log({
+                        'train_loss': loss.item(),
+                        'step': epoch * len(train_loader) + batch_idx
+                    })
                 
             except RuntimeError as e:
                 if "out of memory" in str(e):
-                    print(f"\nCUDA OOM at batch {batch_idx}! Clearing cache...")
+                    print(f"\n⚠️ CUDA OOM at batch {batch_idx}! Skipping...")
                     torch.cuda.empty_cache()
-                    continue  # Skip this batch and continue
+                    continue
                 else:
-                    print(f"\nError at batch {batch_idx}: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    print(f"\n❌ Error at batch {batch_idx}: {e}")
                     continue
             except Exception as e:
-                print(f"\nUnexpected error at batch {batch_idx}: {e}")
+                print(f"\n❌ Unexpected error at batch {batch_idx}: {e}")
                 import traceback
                 traceback.print_exc()
                 continue
         
         if num_batches == 0:
-            print("❌ No successful batches in this epoch!")
+            print("\n❌ No successful batches in this epoch!")
             break
             
         avg_loss = total_loss / num_batches
-        print(f"\n✓ Epoch {epoch+1}: Avg Loss = {avg_loss:.4f} ({num_batches} batches)")
+        print(f"\n✅ Epoch {epoch+1}: Avg Loss = {avg_loss:.4f} ({num_batches}/{len(train_loader)} batches)")
         
         if avg_loss < best_loss:
             best_loss = avg_loss
             checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
-                'text_embed_state_dict': text_embed_layer.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': best_loss,
             }
             torch.save(checkpoint, './checkpoints/malayalam_f5/best_model.pt')
             print(f"💾 Saved best model (loss: {best_loss:.4f})")
         
+        # Save every epoch
         torch.save(checkpoint, f'./checkpoints/malayalam_f5/checkpoint_epoch_{epoch}.pt')
         
         if wandb.run:
-            wandb.log({'epoch': epoch, 'avg_loss': avg_loss})
+            wandb.log({'epoch': epoch, 'avg_loss': avg_loss, 'best_loss': best_loss})
     
     print("\n" + "="*60)
-    print("✓ Training completed!")
+    print("✅ Training completed!")
     print(f"Best loss: {best_loss:.4f}")
+    print(f"Checkpoints saved in: ./checkpoints/malayalam_f5/")
     print("="*60)
     
     if wandb.run:
