@@ -1,4 +1,4 @@
-# train_indicf5.py - Fixed MelSpec
+# train_indicf5.py - CORRECT CFM INITIALIZATION
 import os
 os.environ['TORCH_COMPILE_DISABLE'] = '1'
 
@@ -10,7 +10,7 @@ from tqdm import tqdm
 import numpy as np
 import torchaudio
 
-from f5_tts.model import CFM
+from f5_tts.model import CFM, DiT
 from f5_tts.model.modules import MelSpec
 
 class MalayalamDataset(Dataset):
@@ -71,8 +71,10 @@ def train():
     print(f"\nDevice: {device}")
     print(f"Batch size: {batch_size}")
     
-    # Fixed MelSpec initialization
-    print("\nInitializing mel spectrogram...")
+    # Initialize components
+    print("\nInitializing model components...")
+    
+    # Mel spectrogram converter
     mel_spec = MelSpec(
         n_fft=1024,
         hop_length=256,
@@ -81,17 +83,21 @@ def train():
         target_sample_rate=24000
     ).to(device)
     
-    print("Initializing CFM model...")
+    # Transformer backbone
+    transformer = DiT(
+        dim=1024,
+        depth=22,
+        heads=16,
+        ff_mult=2,
+        text_dim=512,
+        conv_layers=4
+    )
+    
+    # CFM model (Correct initialization)
     model = CFM(
-        transformer=dict(
-            dim=1024,
-            depth=22,
-            heads=16,
-            ff_mult=2,
-            text_dim=512,
-            conv_layers=4
-        ),
-        mel_spec=mel_spec
+        transformer=transformer,
+        sigma=0.0,
+        estimator="nll"
     ).to(device)
     
     print("Loading dataset...")
@@ -126,11 +132,13 @@ def train():
                 audios = batch['audios'].to(device)
                 texts = batch['texts']
                 
+                # Convert to mel spectrogram
                 with torch.no_grad():
                     mels = mel_spec(audios)
                 
                 optimizer.zero_grad()
                 
+                # CFM forward pass
                 loss, _ = model(mels, texts)
                 
                 loss.backward()
@@ -143,7 +151,7 @@ def train():
                 pbar.set_postfix({'loss': f'{loss.item():.4f}', 'avg': f'{total_loss/num_batches:.4f}'})
                 
                 if batch_idx % 50 == 0 and batch_idx > 0:
-                    print(f"\n  Batch {batch_idx}: Loss={loss.item():.4f}, Avg={total_loss/num_batches:.4f}")
+                    print(f"\n  Batch {batch_idx}: Loss={loss.item():.4f}")
                 
             except RuntimeError as e:
                 if "out of memory" in str(e):
@@ -153,7 +161,15 @@ def train():
                 else:
                     if batch_idx < 3:
                         print(f"\n❌ Error: {e}")
+                        import traceback
+                        traceback.print_exc()
                     continue
+            except Exception as e:
+                if batch_idx < 3:
+                    print(f"\n❌ Unexpected error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                continue
         
         if num_batches == 0:
             print("\n❌ No successful batches!")
@@ -184,6 +200,7 @@ def train():
                 'model_state_dict': model.state_dict(),
                 'loss': avg_loss
             }, f'./checkpoints/malayalam_cfm/epoch_{epoch+1}.pt')
+            print(f"💾 Saved epoch {epoch+1} checkpoint")
     
     print(f"\n{'='*60}")
     print(f"✅ Training Complete!")
