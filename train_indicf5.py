@@ -136,7 +136,7 @@ def train():
                 optimizer.zero_grad()
                 
                 # CFM handles mel conversion internally now
-                loss, _ = model(audios, texts)
+                loss = model(audios, texts)
                 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
